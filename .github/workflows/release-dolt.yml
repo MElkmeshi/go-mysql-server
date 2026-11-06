@@ -1,0 +1,92 @@
+name: Release patched Dolt
+
+on:
+  workflow_dispatch:
+    inputs:
+      dolt_ref:
+        description: "dolthub/dolt branch, tag or SHA to build"
+        required: true
+        default: main
+
+concurrency:
+  group: release-dolt
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      GO_BUILD_VERSION: "1.27.3"
+      OS_ARCH_TUPLES: "linux-amd64 linux-arm64 darwin-arm64 darwin-amd64"
+    steps:
+      - name: Check out patched go-mysql-server
+        uses: actions/checkout@v4
+        with:
+          path: gms
+
+      - name: Check out Dolt
+        uses: actions/checkout@v4
+        with:
+          repository: dolthub/dolt
+          ref: ${{ inputs.dolt_ref }}
+          path: dolt
+
+      - name: Build static binaries with Dolt's release script
+        run: |
+          docker run --rm \
+            -v "$PWD/dolt/go":/src \
+            -v "$PWD/gms":/gms \
+            -e OS_ARCH_TUPLES \
+            golang:"$GO_BUILD_VERSION"-trixie \
+            bash -c 'cd /src \
+              && go mod edit -replace github.com/dolthub/go-mysql-server=/gms \
+              && go mod tidy \
+              && /src/utils/publishrelease/buildindocker.sh'
+
+      - name: Smoke test the linux-amd64 binary
+        run: |
+          BIN=dolt/go/out/dolt-linux-amd64/bin/dolt
+          file "$BIN"
+          "$BIN" version
+          mkdir -p "$RUNNER_TEMP/smoke" && cd "$RUNNER_TEMP/smoke"
+          "$GITHUB_WORKSPACE/$BIN" config --global --add user.name ci
+          "$GITHUB_WORKSPACE/$BIN" config --global --add user.email ci@example.com
+          "$GITHUB_WORKSPACE/$BIN" init
+          RESULT=$("$GITHUB_WORKSPACE/$BIN" sql -r csv -q "SELECT ROUND(ST_DISTANCE_SPHERE(POINT(13.18,32.88), POINT(13.20,32.90)), 3) AS d")
+          echo "$RESULT"
+          echo "$RESULT" | grep -q '^2903.966$'
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DOLT_VERSION=$(grep -oE 'Version = "[^"]+"' dolt/go/cmd/dolt/doltversion/version.go | cut -d'"' -f2)
+          DOLT_SHA=$(git -C dolt rev-parse --short HEAD)
+          GMS_SHA=$(git -C gms rev-parse --short HEAD)
+          TAG="dolt-v${DOLT_VERSION}-patched.${GITHUB_RUN_NUMBER}"
+
+          cat > notes.md <<NOTES
+          Dolt ${DOLT_VERSION} (dolthub/dolt@${DOLT_SHA}) built against this fork's go-mysql-server (${GMS_SHA}).
+
+          Adds on top of upstream:
+          - ST_DISTANCE_SPHERE (dolthub/go-mysql-server#4133)
+          - NOT_FIXED_DEC decimals for float result columns (dolthub/go-mysql-server#4134)
+
+          Linux binaries are statically linked and need no ICU or other libraries installed.
+
+          \`\`\`bash
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/dolt-linux-amd64.tar.gz | tar xz
+          sudo install dolt-linux-amd64/bin/dolt /usr/local/bin/dolt
+          \`\`\`
+          NOTES
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Dolt ${DOLT_VERSION} patched (#${GITHUB_RUN_NUMBER})" \
+            --notes-file notes.md \
+            --latest \
+            dolt/go/out/*.tar.gz dolt/go/out/*.rpm
